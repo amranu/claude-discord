@@ -7,7 +7,7 @@ import subprocess
 import aiohttp
 import tempfile
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
@@ -83,6 +83,26 @@ class ClaudeBot(commands.Bot):
         await self.process_commands(message)
 
 bot = ClaudeBot()
+
+def format_usage_limit_message(message: str) -> str:
+    """Convert usage limit message with unix timestamp to human readable format"""
+    if "Claude AI usage limit reached|" in message:
+        try:
+            # Extract timestamp from message like "Claude AI usage limit reached|1750017600"
+            timestamp_str = message.split("|")[1]
+            timestamp = int(timestamp_str)
+            
+            # Convert to datetime
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            
+            # Format as readable string
+            formatted_date = dt.strftime("%B %d, %Y at %H:%M UTC")
+            
+            return f"🚫 **Claude AI Usage Limit Reached**\n⏰ Limit resets on {formatted_date}"
+        except (IndexError, ValueError, OSError) as e:
+            logger.error(f"Error parsing usage limit timestamp: {e}")
+            return "🚫 **Claude AI Usage Limit Reached**\n⏰ Please try again later"
+    return message
 
 def format_todo_content(content: str) -> str:
     """Format todo list content for Discord display"""
@@ -667,24 +687,38 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                             elif msg_type == "result":
                                 # Result message - show completion and final message update
                                 num_turns = data.get('num_turns', 0)
+                                is_error = data.get('is_error', False)
+                                result_content = data.get('result', '')
+                                
+                                # Check for usage limit error
+                                if is_error and "Claude AI usage limit reached|" in result_content:
+                                    formatted_error = format_usage_limit_message(result_content)
+                                    if ctx:
+                                        await ctx.send(formatted_error)
+                                    logger.info(f"Usage limit reached: {result_content}")
+                                    return  # Don't process further
                                 
                                 # Make final update to the last Discord message if there's any remaining content
                                 if current_assistant_message and ctx:
                                     if last_discord_message and not tools_used_after_text:
                                         try:
-                                            # Send the complete final message (only if no tools were used after text)
-                                            if len(current_assistant_message) <= 2000:
-                                                await last_discord_message.edit(content=current_assistant_message)
-                                                sent_text_length = len(current_assistant_message)  # Update tracking
-                                            else:
-                                                # If too long, edit with truncated version and send remaining as new message
-                                                truncated_content = current_assistant_message[:1997] + "..."
-                                                await last_discord_message.edit(content=truncated_content)
-                                                # Send only the remaining part that wasn't in the truncated version
-                                                remaining_content = current_assistant_message[1997:]
-                                                if remaining_content.strip():
-                                                    await send_long_message(ctx, remaining_content)
-                                                sent_text_length = len(current_assistant_message)  # Update tracking
+                                            # Only edit if there's new content beyond what was already sent
+                                            if sent_text_length < len(current_assistant_message):
+                                                # There's new content to add
+                                                if len(current_assistant_message) <= 2000:
+                                                    await last_discord_message.edit(content=current_assistant_message)
+                                                    sent_text_length = len(current_assistant_message)  # Update tracking
+                                                else:
+                                                    # If too long, edit with truncated version and send remaining as new message
+                                                    truncated_content = current_assistant_message[:1997] + "..."
+                                                    await last_discord_message.edit(content=truncated_content)
+                                                    # Send only the remaining part that wasn't in the truncated version
+                                                    # Account for what was already shown in the truncated message
+                                                    remaining_content = current_assistant_message[1997:]
+                                                    if remaining_content.strip():
+                                                        await send_long_message(ctx, remaining_content)
+                                                    sent_text_length = len(current_assistant_message)  # Update tracking
+                                            # If sent_text_length == len(current_assistant_message), nothing new to send
                                         except Exception as e:
                                             logger.error(f"Error updating final message: {e}")
                                             # If edit failed, send only what hasn't been sent yet
