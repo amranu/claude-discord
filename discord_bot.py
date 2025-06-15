@@ -1,9 +1,11 @@
 import os
 import asyncio
 import logging
+import logging.handlers
 import json
 import subprocess
 from typing import Optional
+from datetime import datetime
 
 import discord
 from discord.ext import commands
@@ -15,8 +17,51 @@ load_dotenv()
 # Set Claude CLI path in environment
 os.environ["PATH"] = f"/usr/local/bin/claude:{os.environ.get('PATH', '')}"
 
-logging.basicConfig(level=logging.INFO)
+# Setup logging with file output and rotating logs
+log_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Setup rotating file handler for general logs
+file_handler = logging.handlers.RotatingFileHandler(
+    'logs/discord_bot.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Setup rotating file handler for Claude stream logs (unparsed)
+claude_stream_handler = logging.handlers.RotatingFileHandler(
+    'logs/claude_stream.log',
+    maxBytes=50*1024*1024,  # 50MB for large streams
+    backupCount=10
+)
+claude_stream_formatter = logging.Formatter('%(asctime)s - %(message)s')
+claude_stream_handler.setFormatter(claude_stream_formatter)
+claude_stream_handler.setLevel(logging.INFO)
+
+# Setup console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[file_handler, console_handler]
+)
+
 logger = logging.getLogger(__name__)
+
+# Create separate logger for Claude streams
+claude_stream_logger = logging.getLogger('claude_stream')
+claude_stream_logger.setLevel(logging.INFO)
+claude_stream_logger.addHandler(claude_stream_handler)
+claude_stream_logger.propagate = False  # Don't send to root logger
 
 CLAUDE_CLI_PATH = "/usr/local/bin/claude"
 
@@ -43,7 +88,7 @@ async def send_long_message(ctx, message: str, max_length: int = 2000):
         await ctx.send(message)
         return
     
-    continuation_prefix = "*(...continued)*\n"
+    continuation_prefix = ""
     
     def split_text(text: str, max_len: int) -> list:
         """Recursively split text into chunks that fit within max_len"""
@@ -110,21 +155,9 @@ async def send_long_message(ctx, message: str, max_length: int = 2000):
     # Split the message into chunks
     chunks = split_text(message, max_length)
     
-    # Send all chunks, accounting for continuation prefix length
-    for i, chunk in enumerate(chunks):
-        if i == 0:
-            await ctx.send(chunk)
-        else:
-            # Make sure continuation message fits within limit
-            continuation_msg = continuation_prefix + chunk
-            if len(continuation_msg) <= max_length:
-                await ctx.send(continuation_msg)
-            else:
-                # Split the chunk further to account for prefix
-                available_length = max_length - len(continuation_prefix)
-                sub_chunks = split_text(chunk, available_length)
-                for j, sub_chunk in enumerate(sub_chunks):
-                    await ctx.send(continuation_prefix + sub_chunk)
+    # Send all chunks
+    for chunk in chunks:
+        await ctx.send(chunk)
 
 async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: list = None, 
                              continue_conversation: bool = False, resume_session: str = None, ctx=None) -> str:
@@ -149,12 +182,25 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
         if resume_session:
             cmd.extend(["--resume", resume_session])
         
-        # Run subprocess with streaming
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # Run subprocess with streaming and better error handling
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=1024*1024*10  # 10MB buffer limit
+            )
+        except Exception as e:
+            logger.error(f"Failed to start Claude CLI process: {e}")
+            return f"Error: Failed to start Claude CLI: {str(e)}"
+        
+        # Send empty input to stdin and close it
+        if process.stdin:
+            process.stdin.write(b'\n')
+            await process.stdin.drain()
+            process.stdin.close()
+            await process.stdin.wait_closed()
         
         response_parts = []
         error_parts = []
@@ -172,8 +218,18 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                     if process.stdout is None:
                         break
                     
-                    # Read smaller chunks for true streaming
-                    chunk = await process.stdout.read(1024)
+                    # Read smaller chunks for true streaming with timeout
+                    try:
+                        chunk = await asyncio.wait_for(process.stdout.read(1024), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # No data for 5 seconds, check if process is still alive
+                        if process.returncode is not None:
+                            break
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error reading stdout chunk: {e}")
+                        break
+                    
                     if not chunk:
                         # Stream ended - check if process is still running
                         if process.returncode is not None:
@@ -194,11 +250,19 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                         continue
                     
                     chunk_text = chunk.decode('utf-8', errors='ignore')
+                    
+                    # Log the raw unparsed stream chunk
+                    claude_stream_logger.info(f"RAW_CHUNK: {repr(chunk_text)}")
+                    
                     partial_line += chunk_text
                     
                     # Process complete lines
                     while '\n' in partial_line:
                         line, partial_line = partial_line.split('\n', 1)
+                        
+                        # Log every complete line (unparsed)
+                        claude_stream_logger.info(f"RAW_LINE: {repr(line)}")
+                        
                         line = line.strip()
                         if not line:
                             continue
@@ -240,17 +304,79 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                                         logger.error(f"Error updating Discord message: {e}")
                                                     
                                                     last_send_time = current_time
+                                    
+                                    elif block.get("type") == "tool_use":
+                                        # Display tool use information
+                                        tool_name = block.get("name", "unknown")
+                                        tool_input = block.get("input", {})
+                                        tool_id = block.get("id", "")[:8]  # Show first 8 chars of ID
+                                        
+                                        # Format tool input nicely
+                                        input_preview = ""
+                                        if isinstance(tool_input, dict):
+                                            # Show key details based on tool type
+                                            if tool_name == "Bash" and "command" in tool_input:
+                                                input_preview = f"Command: `{tool_input['command'][:100]}`"
+                                            elif tool_name in ["Read", "Write"] and "file_path" in tool_input:
+                                                input_preview = f"File: `{tool_input['file_path']}`"
+                                            elif tool_name == "Edit" and "file_path" in tool_input:
+                                                old_str = tool_input.get('old_string', '')[:50]
+                                                input_preview = f"File: `{tool_input['file_path']}` (editing `{old_str}...`)"
+                                            elif "path" in tool_input:
+                                                input_preview = f"Path: `{tool_input['path']}`"
+                                            else:
+                                                # Show first few key-value pairs
+                                                preview_items = []
+                                                for k, v in list(tool_input.items())[:2]:
+                                                    if isinstance(v, str) and len(v) > 50:
+                                                        v = v[:50] + "..."
+                                                    preview_items.append(f"{k}: `{v}`")
+                                                input_preview = ", ".join(preview_items)
+                                        
+                                        tool_msg = f"🔧 **Tool Use:** {tool_name}"
+                                        if input_preview:
+                                            tool_msg += f"\n   {input_preview}"
+                                        
+                                        if ctx:
+                                            await ctx.send(tool_msg)
                                         
                             elif msg_type == "user":
-                                # User messages - show what was sent to Claude
+                                # User messages - show what was sent to Claude and tool results
                                 user_msg = data.get('message', {})
                                 message_content = ""
+                                
                                 if isinstance(user_msg.get('content'), list):
                                     for block in user_msg['content']:
                                         if block.get('type') == 'text':
                                             text = block.get('text', '')
                                             if text:
                                                 message_content = f"**User:** {text}"
+                                        elif block.get('type') == 'tool_result':
+                                            # Handle tool results
+                                            tool_use_id = block.get('tool_use_id', '')[:8]
+                                            content = block.get('content', '')
+                                            is_error = block.get('is_error', False)
+                                            
+                                            status = "❌" if is_error else "✅"
+                                            result_preview = ""
+                                            
+                                            if content:
+                                                # Don't truncate - show full output but split long messages
+                                                result_preview = content
+                                                
+                                                # Format as code block if it looks like output
+                                                if '\n' in result_preview or any(c in result_preview for c in ['/', '\\', '$', '>']):
+                                                    result_preview = f"```\n{result_preview}\n```"
+                                                else:
+                                                    result_preview = f"`{result_preview}`"
+                                            
+                                            tool_result_msg = f"{status} **Tool Result**"
+                                            if result_preview:
+                                                tool_result_msg += f"\n{result_preview}"
+                                            
+                                            if ctx:
+                                                await send_long_message(ctx, tool_result_msg)
+                                
                                 elif isinstance(user_msg.get('content'), str):
                                     message_content = f"**User:** {user_msg['content']}"
                                 
@@ -275,8 +401,26 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                     await ctx.send(message_content)
                                     
                             elif msg_type == "result":
-                                # Result message - show completion
+                                # Result message - show completion and final message update
                                 num_turns = data.get('num_turns', 0)
+                                
+                                # Make final update to the last Discord message if there's any remaining content
+                                if current_assistant_message and ctx:
+                                    if last_discord_message:
+                                        try:
+                                            # Send the complete final message
+                                            if len(current_assistant_message) <= 2000:
+                                                await last_discord_message.edit(content=current_assistant_message)
+                                            else:
+                                                # If too long, edit with truncated version and send full version
+                                                await last_discord_message.edit(content=current_assistant_message[:1997] + "...")
+                                                await send_long_message(ctx, current_assistant_message)
+                                        except Exception as e:
+                                            logger.error(f"Error updating final message: {e}")
+                                            await send_long_message(ctx, current_assistant_message)
+                                    else:
+                                        await send_long_message(ctx, current_assistant_message)
+                                
                                 message_content = f"✨ *Conversation completed ({num_turns} turns)*"
                                 if ctx:
                                     await ctx.send(message_content)
@@ -284,6 +428,7 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                             
                         except json.JSONDecodeError:
                             # Non-JSON lines, might be progress info or partial JSON
+                            claude_stream_logger.info(f"NON_JSON_LINE: {repr(line)}")
                             logger.debug(f"Non-JSON line: {line[:100]}...")
                             continue
                         
@@ -303,27 +448,63 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                     break
         
         async def read_stderr():
-            """Read stderr stream"""
+            """Read stderr stream with timeout"""
             while True:
                 try:
                     if process.stderr is None:
                         break
-                    line = await process.stderr.readline()
+                    
+                    try:
+                        line = await asyncio.wait_for(process.stderr.readline(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # No error data for 5 seconds, check if process is still alive
+                        if process.returncode is not None:
+                            break
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error reading stderr line: {e}")
+                        break
+                    
                     if not line:
                         break
-                    error_parts.append(line.decode().strip())
+                    stderr_text = line.decode().strip()
+                    
+                    # Log raw stderr
+                    claude_stream_logger.info(f"STDERR: {repr(stderr_text)}")
+                    
+                    error_parts.append(stderr_text)
                 except Exception as e:
                     logger.error(f"Error reading stderr: {e}")
                     break
         
-        # Run both readers concurrently
-        await asyncio.gather(read_stdout(), read_stderr())
+        # Run both readers concurrently with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(read_stdout(), read_stderr()), 
+                timeout=300.0  # 5 minute timeout for long operations
+            )
+        except asyncio.TimeoutError:
+            logger.error("Claude CLI process timed out after 5 minutes")
+            try:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except:
+                process.kill()
+            return "Error: Claude CLI process timed out"
         
-        # Wait for process to complete
-        await process.wait()
+        # Wait for process to complete with timeout
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.error("Process did not terminate gracefully")
+            try:
+                process.kill()
+                await process.wait()
+            except:
+                pass
         
         if process.returncode != 0:
-            error_msg = '\n'.join(error_parts)
+            error_msg = '\n'.join(error_parts) if error_parts else "Unknown error"
             logger.error(f"Claude CLI error (code {process.returncode}): {error_msg}")
             return f"Error: {error_msg}"
         
@@ -387,6 +568,10 @@ async def call_claude_cli(prompt: str, system_prompt: str = None, tools: list = 
 async def claude_query(ctx, *, prompt: str):
     """Query Claude with persistent conversation and all tools enabled"""
     try:
+        # Log the start of a new Claude interaction
+        claude_stream_logger.info(f"=== NEW CLAUDE INTERACTION ===")
+        claude_stream_logger.info(f"USER: {ctx.author} | CHANNEL: {ctx.channel} | PROMPT: {repr(prompt)}")
+        
         await ctx.send("🤔 Thinking...")
         
         response = await call_claude_enhanced(
@@ -398,6 +583,9 @@ async def claude_query(ctx, *, prompt: str):
             ctx=ctx
         )
         
+        # Log the end of interaction
+        claude_stream_logger.info(f"=== END CLAUDE INTERACTION ===")
+        
         # Response handling is now done in real-time streaming
         # Only send final response if there was an error
         if response and response.startswith("Error:"):
@@ -405,6 +593,7 @@ async def claude_query(ctx, *, prompt: str):
             
     except Exception as e:
         logger.error(f"Error querying Claude: {e}")
+        claude_stream_logger.info(f"ERROR: {repr(str(e))}")
         await ctx.send(f"Sorry, I encountered an error: {str(e)}")
 
 
@@ -412,6 +601,10 @@ async def claude_query(ctx, *, prompt: str):
 async def claude_new_query(ctx, *, prompt: str):
     """Start a new Claude conversation (fresh session)"""
     try:
+        # Log the start of a new Claude interaction
+        claude_stream_logger.info(f"=== NEW CLAUDE CONVERSATION (FRESH) ===")
+        claude_stream_logger.info(f"USER: {ctx.author} | CHANNEL: {ctx.channel} | PROMPT: {repr(prompt)}")
+        
         await ctx.send("🆕 Starting new conversation...")
         
         response = await call_claude_enhanced(
@@ -422,6 +615,9 @@ async def claude_new_query(ctx, *, prompt: str):
             ctx=ctx
         )
         
+        # Log the end of interaction
+        claude_stream_logger.info(f"=== END CLAUDE CONVERSATION ===")
+        
         # Response handling is now done in real-time streaming
         # Only send final response if there was an error
         if response and response.startswith("Error:"):
@@ -429,12 +625,17 @@ async def claude_new_query(ctx, *, prompt: str):
             
     except Exception as e:
         logger.error(f"Error starting new Claude conversation: {e}")
+        claude_stream_logger.info(f"ERROR: {repr(str(e))}")
         await ctx.send(f"Sorry, I encountered an error: {str(e)}")
 
 @bot.command(name='claude_resume')
 async def claude_resume_query(ctx, session_id: str, *, prompt: str):
     """Resume a specific Claude conversation by session ID"""
     try:
+        # Log the start of a resumed Claude interaction
+        claude_stream_logger.info(f"=== RESUME CLAUDE CONVERSATION ===")
+        claude_stream_logger.info(f"USER: {ctx.author} | CHANNEL: {ctx.channel} | SESSION: {session_id} | PROMPT: {repr(prompt)}")
+        
         await ctx.send(f"🔄 Resuming session {session_id[:8]}...")
         
         response = await call_claude_enhanced(
@@ -446,6 +647,9 @@ async def claude_resume_query(ctx, session_id: str, *, prompt: str):
             ctx=ctx
         )
         
+        # Log the end of interaction
+        claude_stream_logger.info(f"=== END CLAUDE RESUME ===")
+        
         # Response handling is now done in real-time streaming
         # Only send final response if there was an error
         if response and response.startswith("Error:"):
@@ -453,6 +657,7 @@ async def claude_resume_query(ctx, session_id: str, *, prompt: str):
             
     except Exception as e:
         logger.error(f"Error resuming Claude conversation: {e}")
+        claude_stream_logger.info(f"ERROR: {repr(str(e))}")
         await ctx.send(f"Sorry, I encountered an error: {str(e)}")
 
 @bot.command(name='help_claude')
