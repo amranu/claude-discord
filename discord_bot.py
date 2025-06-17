@@ -84,6 +84,10 @@ class ClaudeBot(commands.Bot):
 
 bot = ClaudeBot()
 
+# Global variable to track running Claude subprocess
+current_claude_process = None
+current_claude_channel = None
+
 def format_usage_limit_message(message: str) -> str:
     """Convert usage limit message with unix timestamp to human readable format"""
     if "Claude AI usage limit reached|" in message:
@@ -285,9 +289,31 @@ async def send_long_message(ctx, message: str, max_length: int = 2000):
     for chunk in chunks:
         await ctx.send(chunk)
 
+class ActivityTimeout:
+    """Manages timeout that resets on activity"""
+    def __init__(self, base_timeout: float = 300.0):
+        self.base_timeout = base_timeout
+        self.last_activity = asyncio.get_event_loop().time()
+        self.start_time = self.last_activity
+        
+    def reset(self):
+        """Reset the activity timeout"""
+        self.last_activity = asyncio.get_event_loop().time()
+        
+    def time_remaining(self) -> float:
+        """Get remaining time before timeout"""
+        current_time = asyncio.get_event_loop().time()
+        elapsed_since_activity = current_time - self.last_activity
+        return max(0, self.base_timeout - elapsed_since_activity)
+        
+    def is_expired(self) -> bool:
+        """Check if timeout has expired"""
+        return self.time_remaining() <= 0
+
 async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: list = None, 
                              continue_conversation: bool = False, resume_session: str = None, ctx=None) -> str:
     """Enhanced Claude CLI call that handles streaming responses properly"""
+    global current_claude_process, current_claude_channel
     try:
         cmd = [
             CLAUDE_CLI_PATH,
@@ -317,6 +343,9 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                 stderr=asyncio.subprocess.PIPE,
                 limit=1024*1024*10  # 10MB buffer limit
             )
+            # Store process reference globally for stop command
+            current_claude_process = process
+            current_claude_channel = ctx.channel if ctx else None
         except Exception as e:
             logger.error(f"Failed to start Claude CLI process: {e}")
             return f"Error: Failed to start Claude CLI: {str(e)}"
@@ -330,6 +359,9 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
         
         response_parts = []
         error_parts = []
+        
+        # Create activity timeout tracker
+        activity_timeout = ActivityTimeout(300.0)  # 5 minute base timeout
         
         async def read_stdout():
             """Read and parse stdout stream continuously with true streaming"""
@@ -364,12 +396,12 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                             # Process has terminated - send any remaining text
                             if current_assistant_message and ctx:
                                 if last_discord_message and not tools_used_after_text:
-                                    try:
-                                        await last_discord_message.edit(content=current_assistant_message[:2000])
-                                        sent_text_length = len(current_assistant_message)  # Update tracking
-                                    except:
-                                        await send_long_message(ctx, current_assistant_message)
-                                        sent_text_length = len(current_assistant_message)  # Update tracking
+                                    # Send remaining text that hasn't been sent yet
+                                    remaining_text = current_assistant_message[sent_text_length:]
+                                    if remaining_text.strip():
+                                        await send_long_message(ctx, remaining_text)
+                                        sent_text_length = len(current_assistant_message)
+                                        activity_timeout.reset()  # Reset timeout
                                 else:
                                     # Send only remaining text if tools were used
                                     if tools_used_after_text and sent_text_length < len(current_assistant_message):
@@ -377,18 +409,22 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                         if remaining_text.strip():
                                             await send_long_message(ctx, remaining_text)
                                             sent_text_length = len(current_assistant_message)  # Update tracking
+                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                     elif not tools_used_after_text and sent_text_length == 0:
                                         # Send full message only if nothing has been sent yet
                                         await send_long_message(ctx, current_assistant_message)
                                         sent_text_length = len(current_assistant_message)  # Update tracking
+                                        last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                     elif not tools_used_after_text and sent_text_length < len(current_assistant_message):
                                         # Send only remaining text if some was already sent
                                         remaining_text = current_assistant_message[sent_text_length:]
                                         if remaining_text.strip():
                                             await send_long_message(ctx, remaining_text)
                                             sent_text_length = len(current_assistant_message)  # Update tracking
+                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                             elif accumulated_text and ctx:
                                 await send_long_message(ctx, accumulated_text)
+                                last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                             break
                         # Process still running, wait a bit and continue
                         await asyncio.sleep(0.1)
@@ -438,22 +474,13 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                                         message_to_send = message_to_send[:-3] + "..."
                                                     
                                                     try:
-                                                        if last_discord_message and not tools_used_after_text:
-                                                            # Only edit if no tools have been used after text was sent
-                                                            await last_discord_message.edit(content=message_to_send)
-                                                            sent_text_length = len(current_assistant_message)  # Update tracking
-                                                        else:
-                                                            # Send new message with only the new text after tools
-                                                            if tools_used_after_text:
-                                                                new_text = current_assistant_message[sent_text_length:]
-                                                                if new_text.strip():  # Only send if there's actually new text
-                                                                    last_discord_message = await ctx.send(new_text[:2000])
-                                                                    sent_text_length = len(current_assistant_message)
-                                                            else:
-                                                                # First message or no tools used yet
-                                                                last_discord_message = await ctx.send(message_to_send)
-                                                                sent_text_length = len(current_assistant_message)
+                                                        # Always send only new text, never edit
+                                                        new_text = current_assistant_message[sent_text_length:]
+                                                        if new_text.strip():
+                                                            last_discord_message = await send_long_message(ctx, new_text)
+                                                            sent_text_length = len(current_assistant_message)
                                                             tools_used_after_text = False  # Reset for future text
+                                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                                     except discord.errors.HTTPException:
                                                         # If edit fails, send new message
                                                         if tools_used_after_text:
@@ -461,9 +488,11 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                                             if new_text.strip():
                                                                 last_discord_message = await ctx.send(new_text[:2000])
                                                                 sent_text_length = len(current_assistant_message)
+                                                                last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                                         else:
                                                             last_discord_message = await ctx.send(message_to_send)
                                                             sent_text_length = len(current_assistant_message)
+                                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                                         tools_used_after_text = False
                                                     except Exception as e:
                                                         logger.error(f"Error updating Discord message: {e}")
@@ -482,6 +511,7 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                             
                                             thinking_msg = f"💭 **Claude's Thinking:**\n```\n{thinking_preview}\n```"
                                             await ctx.send(thinking_msg)
+                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                     
                                     elif block.get("type") == "tool_use":
                                         # Mark that tools are being used after text was sent
@@ -531,6 +561,7 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                                     if todos and ctx:
                                                         formatted_todos = format_todos_list(todos)
                                                         await ctx.send(formatted_todos)
+                                                        activity_timeout.reset()  # Reset timeout
                                             elif tool_name == "MultiEdit" and "file_path" in tool_input:
                                                 # For MultiEdit, show file and number of edits
                                                 edits_count = len(tool_input.get('edits', []))
@@ -562,6 +593,7 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                         
                                         if ctx:
                                             await ctx.send(tool_msg)
+                                            last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                         
                             elif msg_type == "user":
                                 # User messages - show what was sent to Claude and tool results
@@ -645,15 +677,18 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                                 elif is_todo_result:
                                                     # Always send todo results, they're important for user visibility
                                                     await send_long_message(ctx, tool_result_msg)
+                                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                                 else:
                                                     # Send other tool results with full content (but truncated)
                                                     await send_long_message(ctx, tool_result_msg)
+                                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                 
                                 elif isinstance(user_msg.get('content'), str):
                                     message_content = f"**User:** {user_msg['content']}"
                                 
                                 if message_content and ctx:
                                     await ctx.send(message_content)
+                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                 
                             elif msg_type == "system":
                                 # System messages - show progress info
@@ -683,6 +718,7 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                 
                                 if message_content and ctx:
                                     await ctx.send(message_content)
+                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                     
                             elif msg_type == "result":
                                 # Result message - show completion and final message update
@@ -695,59 +731,27 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                     formatted_error = format_usage_limit_message(result_content)
                                     if ctx:
                                         await ctx.send(formatted_error)
+                                        last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                     logger.info(f"Usage limit reached: {result_content}")
                                     return  # Don't process further
                                 
-                                # Make final update to the last Discord message if there's any remaining content
+                                # Send any remaining content that hasn't been sent yet
                                 if current_assistant_message and ctx:
-                                    if last_discord_message and not tools_used_after_text:
-                                        try:
-                                            # Only edit if there's new content beyond what was already sent
-                                            if sent_text_length < len(current_assistant_message):
-                                                # There's new content to add
-                                                if len(current_assistant_message) <= 2000:
-                                                    await last_discord_message.edit(content=current_assistant_message)
-                                                    sent_text_length = len(current_assistant_message)  # Update tracking
-                                                else:
-                                                    # If too long, edit with truncated version and send remaining as new message
-                                                    truncated_content = current_assistant_message[:1997] + "..."
-                                                    await last_discord_message.edit(content=truncated_content)
-                                                    # Send only the remaining part that wasn't in the truncated version
-                                                    # Account for what was already shown in the truncated message
-                                                    remaining_content = current_assistant_message[1997:]
-                                                    if remaining_content.strip():
-                                                        await send_long_message(ctx, remaining_content)
-                                                    sent_text_length = len(current_assistant_message)  # Update tracking
-                                            # If sent_text_length == len(current_assistant_message), nothing new to send
-                                        except Exception as e:
-                                            logger.error(f"Error updating final message: {e}")
-                                            # If edit failed, send only what hasn't been sent yet
-                                            if sent_text_length < len(current_assistant_message):
-                                                remaining_content = current_assistant_message[sent_text_length:]
-                                                if remaining_content.strip():
-                                                    await send_long_message(ctx, remaining_content)
-                                            sent_text_length = len(current_assistant_message)  # Update tracking
-                                    else:
-                                        # Send only remaining text if tools were used after text
-                                        if tools_used_after_text and sent_text_length < len(current_assistant_message):
-                                            remaining_text = current_assistant_message[sent_text_length:]
-                                            if remaining_text.strip():
-                                                await send_long_message(ctx, remaining_text)
-                                                sent_text_length = len(current_assistant_message)  # Update tracking
-                                        elif not tools_used_after_text and sent_text_length == 0:
-                                            # Send full message only if nothing has been sent yet
-                                            await send_long_message(ctx, current_assistant_message)
-                                            sent_text_length = len(current_assistant_message)  # Update tracking
-                                        elif not tools_used_after_text and sent_text_length < len(current_assistant_message):
-                                            # Send only remaining text if some was already sent
-                                            remaining_text = current_assistant_message[sent_text_length:]
-                                            if remaining_text.strip():
-                                                await send_long_message(ctx, remaining_text)
-                                                sent_text_length = len(current_assistant_message)  # Update tracking
+                                    if sent_text_length < len(current_assistant_message):
+                                        # There's new content to add
+                                        remaining_content = current_assistant_message[sent_text_length:]
+                                        if remaining_content.strip():
+                                            try:
+                                                await send_long_message(ctx, remaining_content)
+                                                sent_text_length = len(current_assistant_message)
+                                                last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
+                                            except Exception as e:
+                                                logger.error(f"Error sending final message: {e}")
                                 
                                 message_content = f"✨ *Conversation completed ({num_turns} turns)*"
                                 if ctx:
                                     await ctx.send(message_content)
+                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                 logger.info(f"Got result message with {num_turns} turns")
                             
                         except json.JSONDecodeError:
@@ -761,12 +765,12 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                         # Process ended normally
                         if current_assistant_message and ctx:
                             if last_discord_message and not tools_used_after_text:
-                                try:
-                                    await last_discord_message.edit(content=current_assistant_message[:2000])
-                                    sent_text_length = len(current_assistant_message)  # Update tracking
-                                except:
-                                    await send_long_message(ctx, current_assistant_message)
-                                    sent_text_length = len(current_assistant_message)  # Update tracking
+                                # Send remaining text that hasn't been sent yet
+                                remaining_text = current_assistant_message[sent_text_length:]
+                                if remaining_text.strip():
+                                    await send_long_message(ctx, remaining_text)
+                                    sent_text_length = len(current_assistant_message)
+                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                             else:
                                 # Send only remaining text if tools were used
                                 if tools_used_after_text and sent_text_length < len(current_assistant_message):
@@ -774,16 +778,19 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                                     if remaining_text.strip():
                                         await send_long_message(ctx, remaining_text)
                                         sent_text_length = len(current_assistant_message)  # Update tracking
+                                        last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                 elif not tools_used_after_text and sent_text_length == 0:
                                     # Send full message only if nothing has been sent yet
                                     await send_long_message(ctx, current_assistant_message)
                                     sent_text_length = len(current_assistant_message)  # Update tracking
+                                    last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                                 elif not tools_used_after_text and sent_text_length < len(current_assistant_message):
                                     # Send only remaining text if some was already sent
                                     remaining_text = current_assistant_message[sent_text_length:]
                                     if remaining_text.strip():
                                         await send_long_message(ctx, remaining_text)
                                         sent_text_length = len(current_assistant_message)  # Update tracking
+                                        last_activity_time = asyncio.get_event_loop().time()  # Reset timeout
                         break
                     logger.error(f"Error reading stdout: {e}")
                     break
@@ -818,20 +825,43 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
                     logger.error(f"Error reading stderr: {e}")
                     break
         
-        # Run both readers concurrently with timeout
+        # Run both readers with dynamic timeout that resets on activity
+        async def run_with_activity_timeout():
+            readers_task = asyncio.create_task(asyncio.gather(read_stdout(), read_stderr()))
+            
+            while not readers_task.done():
+                try:
+                    remaining_time = activity_timeout.time_remaining()
+                    if remaining_time <= 0:
+                        logger.error("Claude CLI process timed out due to inactivity (5 minutes)")
+                        readers_task.cancel()
+                        try:
+                            process.terminate()
+                            await asyncio.wait_for(process.wait(), timeout=5.0)
+                        except:
+                            process.kill()
+                        return "Error: Claude CLI process timed out due to inactivity"
+                    
+                    # Wait for completion or short timeout to check activity again
+                    await asyncio.wait_for(asyncio.shield(readers_task), timeout=min(remaining_time, 10.0))
+                    break
+                    
+                except asyncio.TimeoutError:
+                    # Check if process finished
+                    if process.returncode is not None:
+                        break
+                    # Continue loop to check activity timeout again
+                    continue
+                    
+            return await readers_task
+        
         try:
-            await asyncio.wait_for(
-                asyncio.gather(read_stdout(), read_stderr()), 
-                timeout=300.0  # 5 minute timeout for long operations
-            )
-        except asyncio.TimeoutError:
-            logger.error("Claude CLI process timed out after 5 minutes")
-            try:
-                process.terminate()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except:
-                process.kill()
-            return "Error: Claude CLI process timed out"
+            await run_with_activity_timeout()
+        except Exception as e:
+            if "timed out" in str(e):
+                return str(e)
+            logger.error(f"Error in activity timeout handler: {e}")
+            return f"Error: {e}"
         
         # Wait for process to complete with timeout
         try:
@@ -847,13 +877,23 @@ async def call_claude_enhanced(prompt: str, system_prompt: str = None, tools: li
         if process.returncode != 0:
             error_msg = '\n'.join(error_parts) if error_parts else "Unknown error"
             logger.error(f"Claude CLI error (code {process.returncode}): {error_msg}")
+            # Clear global process reference
+            current_claude_process = None
+            current_claude_channel = None
             return f"Error: {error_msg}"
+        
+        # Clear global process reference on successful completion
+        current_claude_process = None
+        current_claude_channel = None
         
         result = ''.join(response_parts).strip()
         return result if result else "No response generated"
         
     except Exception as e:
         logger.error(f"Error calling enhanced Claude CLI: {e}")
+        # Clear global process reference on exception
+        current_claude_process = None
+        current_claude_channel = None
         return f"Error: {str(e)}"
 
 async def call_claude_cli(prompt: str, system_prompt: str = None, tools: list = None, max_turns: int = 1) -> str:
@@ -1067,6 +1107,73 @@ async def claude_resume_query(ctx, session_id: str, *, prompt: str = ""):
         claude_stream_logger.info(f"ERROR: {repr(str(e))}")
         await ctx.send(f"Sorry, I encountered an error: {str(e)}")
 
+@bot.command(name='stop')
+async def stop_claude(ctx):
+    """Stop the currently running Claude subprocess gracefully"""
+    global current_claude_process, current_claude_channel
+    
+    if current_claude_process is None:
+        await ctx.send("🚫 No Claude process is currently running.")
+        return
+    
+    try:
+        # Check if process is still running
+        if current_claude_process.returncode is not None:
+            await ctx.send("ℹ️ Claude process has already completed.")
+            current_claude_process = None
+            current_claude_channel = None
+            return
+        
+        await ctx.send("🛑 Stopping Claude process gracefully...")
+        
+        # Try graceful termination first
+        current_claude_process.terminate()
+        logger.info("Sent SIGTERM to Claude process")
+        
+        try:
+            # Wait up to 10 seconds for graceful shutdown
+            await asyncio.wait_for(current_claude_process.wait(), timeout=10.0)
+            logger.info("Claude process terminated gracefully")
+            termination_method = "gracefully terminated"
+        except asyncio.TimeoutError:
+            # Force kill if it doesn't terminate gracefully
+            logger.warning("Claude process did not terminate gracefully, forcing kill")
+            current_claude_process.kill()
+            await current_claude_process.wait()
+            termination_method = "force killed"
+        
+        # Get the return code
+        return_code = current_claude_process.returncode
+        
+        # Store original channel before clearing
+        original_channel = current_claude_channel
+        
+        # Clear global references
+        current_claude_process = None
+        current_claude_channel = None
+        
+        # Send results to Discord
+        result_message = f"✅ **Claude Process Stopped**\n"
+        result_message += f"📊 **Details:**\n"
+        result_message += f"• Status: {termination_method}\n"
+        result_message += f"• Exit code: {return_code}\n"
+        result_message += f"• Stopped by: {ctx.author.mention}"
+        
+        await ctx.send(result_message)
+        
+        # Also send to the original channel if different
+        if original_channel and original_channel != ctx.channel:
+            await original_channel.send(f"🛑 Claude process was stopped by {ctx.author.mention} in {ctx.channel.mention}")
+        
+        logger.info(f"Claude process stopped by {ctx.author} (ID: {ctx.author.id}) in channel {ctx.channel}")
+        
+    except Exception as e:
+        logger.error(f"Error stopping Claude process: {e}")
+        await ctx.send(f"❌ Error stopping Claude process: {str(e)}")
+        # Clear references even on error
+        current_claude_process = None
+        current_claude_channel = None
+
 @bot.command(name='help_claude')
 async def help_claude(ctx):
     """Show available Claude bot commands"""
@@ -1075,6 +1182,7 @@ async def help_claude(ctx):
 • `!claude <prompt>` - Ask Claude (continues previous conversation)
 • `!claude_new <prompt>` - Start a fresh conversation
 • `!claude_resume <session_id> <prompt>` - Resume a specific conversation
+• `!stop` - Stop the currently running Claude process gracefully
 • `!help_claude` - Show this help message
 
 **File Upload Support:**
